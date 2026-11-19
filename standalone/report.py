@@ -10,6 +10,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdfcanvas
 from reportlab.platypus import Paragraph
+from .packet_opening import opening_description
 
 NAVY = colors.HexColor('#0c1c2b')
 TEAL = colors.HexColor('#008b8b')
@@ -134,9 +135,17 @@ def write_session_report(path, directory, work, flow, result, finish_t, clock_te
         button(result.get('sealing_video'), 'packet sealing video', margin, top-25, 160)
         text('Last updated: '+result['report_updated'], margin+173, top-31, 8, limit=usable-173)
         text('Status: '+result['status'], margin, top-64, 8)
+        if result.get('placement_review_required'):
+            ids=', '.join(f'J{jid}' for jid in result.get('unconfirmed_placements',[]))
+            text('PLACEMENT REVIEW: '+ids+' unconfirmed. Sealing does not verify packet contents.', margin, 108, 7, TEAL, True)
         text('Placement follows the pickup-owned transfer. Sealing is inferred from verified strip removal; '
              'adhesive closure and strength are not measured. Packet rotation itself is not verified.',
              margin, 87, 8)
+        model=result.get('packet_opening_model',{})
+        accuracy=model.get('validation',{}).get('accuracy')
+        model_text=f'held-out accuracy {accuracy:.1%}' if accuracy is not None else model.get('status','unavailable')
+        text('Packet-view classifier: '+model_text+'. Advisory observations; no proof of insertion or sealing.',
+             margin, 57, 7)
         canvas.showPage()
 
     for record in records:
@@ -156,23 +165,58 @@ def write_session_report(path, directory, work, flow, result, finish_t, clock_te
         panel_w = (usable-gap)/2
         for index, (label, suffix, event_t) in enumerate([
                 ('01 / Pickup', 'pickup', j.started),
-                ('02 / Packet interaction', 'entry', j.entry)]):
+                ('02 / Packet interaction', 'entry', j.entry if j.entry is not None else j.interaction_at)]):
             x = margin+index*(panel_w+gap)
             text(label, x, top, 10, TEAL, True, panel_w)
             picture(work / f'J{j.id}_{suffix}.jpg', x, top-24, panel_w, 140)
             text(timestamp(event_t), x, top-171, 8, limit=panel_w)
         top -= 202
-        text('03 / Placement result retained', margin, top, 10, TEAL, True)
-        picture(work / f'J{j.id}_after.jpg', margin, top-24, usable, 173)
-        text(timestamp(j.ended)+' | Placement inferred from this transfer.', margin, top-204, 8)
-        top -= 231
+        text('03 / Placement frame' if record.get('placement_frame') else '03 / Placement result retained',
+             margin, top, 10, TEAL, True)
+        picture(directory / record['placement_frame'] if record.get('placement_frame') else work / f'J{j.id}_after.jpg',
+                margin, top-24, usable, 125)
+        text(timestamp(j.ended)+(' | Placement inferred from this transfer.' if j.status=='Placed in packet — inferred'
+                                else ' | Placement not confirmed; review this transfer.'), margin, top-156, 8)
+        top -= 183
         card(margin, top, usable, 79)
         text('RECORDING / PLACEMENT', margin+10, top-8, 9, TEAL, True)
         text('Recording handoff / finish: '+timestamp(clip_end), margin+10, top-26, 8)
         text('Recording review: '+('; '.join(record['evidence_issues']) or 'No coverage issue found'),
              margin+10, top-42, 8, limit=usable-20)
         text(j.note, margin+10, top-57, 7, limit=usable-20)
+        top -= 88
+        text('PLACEMENT FRAME / PACKET CLASSIFICATION', margin, top, 8, TEAL, True)
+        description_height=text(opening_description(record), margin, top-15, 7, limit=usable)
+        placement=record.get('packet_opening_at_placement')
+        observations=record.get('packet_opening_observations',[])
+        if placement:
+            text('Placement-frame timestamp: '+timestamp(placement.get('timestamp')),margin,top-20-description_height,7)
+        elif observations:
+            text('Observed: '+timestamp(observations[0]['first_seen'])+' to '+timestamp(observations[-1]['last_seen']),
+                 margin, top-20-description_height, 7)
         canvas.showPage()
+    testing = result.get('testing_session')
+    if testing:
+        for test in testing['jewels']:
+            header(f"J{test['id']} | Jewel testing result", 'Capture completed before packing; analysis may finish in the background')
+            top = height-135
+            prediction = test.get('prediction')
+            text(str(prediction['prediction']).upper() if prediction else 'INCOMPLETE - NO ACID RESULT',
+                 margin, top, 18, TEAL, True)
+            detail = (f"Model confidence: {prediction['confidence']:.1%}" if prediction else
+                      'Reason: '+(test.get('close_reason') or 'No material prediction was generated.'))
+            text(detail, margin, top-35, 10)
+            if not prediction:
+                text('Packing/sealing does not complete or pass this jewel test.', margin, top-85, 9, TEAL, True)
+            text('Rubbing observed: '+str(test['rubbed'])+' | Acid capture complete: '+str(test['acid_done']),
+                 margin, top-65, 10)
+            text('Original jewel photo', margin, top-105, 11, TEAL, True)
+            picture(work / f"J{test['id']}_initial.jpg", margin, top-130, usable, 190)
+            text('Testing evidence directory: '+testing['directory'], margin, top-345, 9)
+            button(testing.get('report'), 'full jewel testing report', margin, top-400, 220)
+            text('Testing, packing, strip-removal inference and OCR are separate recorded outcomes.',
+                 margin, 85, 9)
+            canvas.showPage()
     sealing_start = result.get('sealing_started_at')
     sealing_end = result.get('sealing_ended_at')
     header('Sealed packet | Sealing evidence',
@@ -190,10 +234,17 @@ def write_session_report(path, directory, work, flow, result, finish_t, clock_te
     # Use the actual sealing-time frame, never the later rotated/OCR frame.
     picture(work / 'sealed.jpg', margin, top-27, usable, 320)
     text('Sealing image captured: '+timestamp(sealing_end), margin, top-362, 9)
-    text('Sealing starts when all jewels have been placed. Sealing ends when strip removal '
-         'is confirmed; the later rotation and OCR stage is recorded separately.',
+    text('Sealing starts at the first validated strip detection, independently of jewel placement results. '
+         'Sealing ends when strip removal is confirmed; rotation and OCR are recorded separately.',
          margin, top-387, 9)
+    if result.get('placement_review_required'):
+        text('JEWEL PLACEMENTS UNCONFIRMED: '+', '.join(f'J{jid}' for jid in result.get('unconfirmed_placements',[])),
+             margin, top-418, 8, TEAL, True)
     button(result.get('sealing_video'), 'packet sealing video', margin, top-431, 170)
+    diagnostic = result.get('sealing_diagnostics', {}).get('last', {})
+    if diagnostic:
+        text('Last removal check: '+diagnostic.get('blocker', 'unavailable')+
+             f" | {diagnostic.get('absent_hits', 0)}/5 clear observations; {diagnostic.get('clear_seconds', 0):.1f}/1.0 s", margin, 108, 8)
     text('Sealing is inferred from verified strip removal; adhesive closure and strength are not measured.',
          margin, 80, 8)
     canvas.showPage()

@@ -1,0 +1,2 @@
+# Additional dependency for the third standalone pickup mode (.venv-slic).
+mediapipe==1.2.3

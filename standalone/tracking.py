@@ -9,8 +9,8 @@ from .transfer import TransferFollower
 
 
 class GoldPredictor:
-    def __init__(self):
-        self.model = OpenVINOYolo(original.MODEL_PATH)
+    def __init__(self, backend=None):
+        self.model = backend if backend is not None else OpenVINOYolo(original.MODEL_PATH)
 
     def predict(self, frame, **kwargs):
         kwargs.pop("_live_job", None)
@@ -19,11 +19,11 @@ class GoldPredictor:
 
 
 class TrackingBridge(original.Worker):
-    def __init__(self, roi):
+    def __init__(self, roi, previous=None):
         super().__init__(0, roi, continuous=True)
         if not self.identity_slic:
             raise RuntimeError("SLIC is unavailable. Start with run_packet_sealing.sh and .venv-slic.")
-        self.model = GoldPredictor()
+        self.model = GoldPredictor(previous.model if previous is not None else None)
         self.identity_error = ""
         self.event.connect(self._event, original.QtCore.Qt.DirectConnection)
         self.inactive_ids = set()
@@ -39,6 +39,17 @@ class TrackingBridge(original.Worker):
         self.pickup_followers = {}
         self.pickup_seeds = {}
         self.raw_detections = []
+        if previous is not None:
+            # Camera tracking has stopped. Background result jobs may still drain.
+            # Use the shared gold dispatcher so recovery and packing never race the runtime.
+            self.tracks = previous.tracks
+            self.id_model = previous.id_model
+            self.identity_extractor = previous.identity_extractor
+            self.mode = "LOCKED"
+            self.frame_wh = previous.frame_wh
+            self.continuous_identity = {tr.id: True for tr in self.tracks}
+            self.bench_anchors = {tr.id: (tuple(map(float, tr.pos)), tuple(map(float, tr.box)))
+                                  for tr in self.tracks}
 
     def _event(self, message, level):
         if "gallery unavailable" in message:

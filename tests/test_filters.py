@@ -23,6 +23,44 @@ class FilterTests(unittest.TestCase):
         self.models.filter_bag = Mock(return_value=.9)
         self.models.filter_strip = Mock(return_value=.9)
 
+    def test_all_segmenters_and_filters_receive_original_camera_pixels(self):
+        frame = np.random.default_rng(7).integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
+        roi = np.full(frame.shape[:2], 255, np.uint8)
+        packet = np.zeros_like(roi)
+        packet[200:900, 400:1500] = 255
+        strip = np.zeros_like(roi)
+        strip[220:250, 450:1450] = 255
+        self.models.bag.detect.return_value = [Detection(packet, (400, 200, 1500, 900), .9)]
+        self.models.strip.detect.return_value = [Detection(strip, (450, 220, 1450, 250), .9)]
+        bag, state, clear, strip_mask, hand_mask = self.models.inspect(frame, roi)
+        for detector in (self.models.bag, self.models.strip, self.models.hand):
+            self.assertIs(detector.detect.call_args.args[0], frame)
+        np.testing.assert_array_equal(self.models.filter_bag.call_args.args[0], frame[200:900, 400:1500])
+        np.testing.assert_array_equal(self.models.filter_strip.call_args.args[0], frame[220:250, 450:1450])
+        self.assertEqual(bag.box, (400, 200, 1500, 900))
+        self.assertEqual(state, 'present')
+        self.assertTrue(clear)
+        np.testing.assert_array_equal(strip_mask, strip)
+        self.assertEqual(hand_mask.shape, frame.shape[:2])
+
+    def test_low_scoring_genuine_bag_is_retained_by_both_detection_routes(self):
+        self.models.filter_bag.return_value = .25
+        self.assertIsNotNone(self.models.inspect(self.frame, self.mask)[0])
+        self.assertEqual(1, len(self.models.detect(self.frame)))
+        diagnostic = self.models.last_diagnostic
+        self.assertEqual(.2, diagnostic['bag_filter_threshold'])
+        self.assertEqual('accepted', diagnostic['bag_candidates'][0]['decision'])
+        self.assertEqual(.25, diagnostic['bag_candidates'][0]['filter_probability'])
+
+    def test_threshold_remains_configurable_and_rejections_are_logged(self):
+        self.models.bag_filter_threshold = .6
+        self.models.filter_bag.return_value = .55
+        self.assertIsNone(self.models.inspect(self.frame, self.mask)[0])
+        self.assertEqual([], self.models.detect(self.frame))
+        diagnostic = self.models.last_diagnostic
+        self.assertEqual('filter_rejected', diagnostic['bag_candidates'][0]['decision'])
+        self.assertEqual(.55, diagnostic['bag_candidates'][0]['filter_probability'])
+
     def test_rejected_strip_candidate_is_uncertain(self):
         self.models.filter_strip.return_value = .1
         _, strip, _, _, _ = self.models.inspect(self.frame, self.mask)

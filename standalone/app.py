@@ -19,13 +19,13 @@ from .models import PacketModels
 from .tracking import TrackingBridge, draw_gold, packet_overlap
 from .packet_region import PacketRegion
 from .packet_motion import PacketMotion
-from .seal_context import SealContext
 from .transfer import TransferFollower
 from .gold_transfer import GoldTransfer, packet_position, interaction_region
 from .camera import make_grabber
 from .settings import tracker_camera, tracker_roi, tracker_source
 from .preview import DetectionPreview
 from .packet_ocr import PacketOCR
+from .packet_opening import PacketOpening
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,9 +36,10 @@ class PacketWorker(QtCore.QThread):
     exported = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, source, roi, parent=None):
+    def __init__(self, source, roi, parent=None, *, handoff=None):
         super().__init__(parent)
         self.source, self.roi_points = source, roi
+        self.handoff = handoff
         self.commands = Queue()
         self.running = True
         self.directory = None
@@ -59,10 +60,10 @@ class PacketWorker(QtCore.QThread):
         self.packet_gold_history = []
         self.transfer = TransferFollower()
         self.packet_motion = PacketMotion()
-        self.seal_context = SealContext()
         self.identities_announced = False
         self.ocr = None
         self.sealed_state = None
+        self.packet_opening = PacketOpening(ROOT/'packet_mouth_lab'/'models'/'packet_bbox_classifier.joblib')
 
     def _restart_assignment(self):
         self.tracker.reset_assignment()
@@ -74,10 +75,10 @@ class PacketWorker(QtCore.QThread):
         self.packet_gold_history = []
         self.transfer = TransferFollower()
         self.packet_motion = PacketMotion()
-        self.seal_context = SealContext()
         self.identities_announced = False
         self.gold_overlay.clear()
         self.live_overlay.clear()
+        self.packet_opening.reset()
 
     def command(self, name, value=None):
         self.commands.put((name, value))
@@ -113,19 +114,23 @@ class PacketWorker(QtCore.QThread):
         exe = None
         error = None
         try:
-            self.notice.emit("Loading packet models and the SLIC jewel tracker…")
+            self.notice.emit("Loading packet models; retaining tested jewel IDs…" if self.handoff else
+                             "Loading packet models and the SLIC jewel tracker…")
             exe = ffmpeg_path()
             models = PacketModels(ROOT / "model onnx")
-            self.tracker = TrackingBridge(self.roi_points)
-            self.directory = ROOT / "outputs" / (datetime.now(TIMEZONE).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6])
+            previous = self.handoff['worker'] if self.handoff else None
+            self.tracker = TrackingBridge(self.roi_points, previous=previous) if previous is not None else TrackingBridge(self.roi_points)
+            self.directory = (Path(self.handoff['testing']['directory']) / 'packet_sealing' if self.handoff else
+                              ROOT / "outputs" / (datetime.now(TIMEZONE).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]))
             work = self.directory / ".working"
             work.mkdir(parents=True)
             recorder = Recorder(work)
-            camera = tracker_camera(self.source)
+            camera = self.handoff["worker"].camera if self.handoff else tracker_camera(self.source)
             self.grabber = make_grabber(self.source, camera)
             self.grabber.on_frame = recorder.offer
             self.grabber.start()
-            self.notice.emit("INT8 gold model ready. All jewels in the ROI will receive IDs automatically when stable.")
+            self.notice.emit("Tested jewel IDs and gold model retained. Keep the jewels on their bench positions until packing begins."
+                             if self.handoff else "INT8 gold model ready. All jewels in the ROI will receive IDs automatically when stable.")
             packet_region = PacketRegion()
             last_camera_ts = None
             stale_notified = False
@@ -140,8 +145,11 @@ class PacketWorker(QtCore.QThread):
                                             "Video source finished before sealing checks passed.")
                         break
                     if last_camera_ts and time.time() - last_camera_ts > 2.5:
+                        self.packet_opening.reset()
                         if self.flow and not stale_notified:
                             self.flow.invalidate_packet("Camera stream interrupted. Pickup and placement results retained; evidence needs review.")
+                        if not stale_notified:
+                            self._log_sealing_diagnostic(None, time.time(), dict(timestamp=time.time(), blocker='camera_stream_interrupted'))
                         stale_notified = True
                         self.notice.emit("Camera stream interrupted. Packing and sealing are suspended.")
                     elif not last_camera_ts:
@@ -152,6 +160,8 @@ class PacketWorker(QtCore.QThread):
                 last_camera_ts = t
                 self.last_frame, self.last_t = frame, t
                 if time.time() - t > 1.5:
+                    self.packet_opening.reset()
+                    self._log_sealing_diagnostic(None, t, dict(timestamp=t, blocker='stale_camera_frame', frame_age_seconds=time.time()-t))
                     self.notice.emit("Camera image is stale. Waiting for a fresh frame.")
                     continue
                 if self.flow and self.flow.sealed:
@@ -172,11 +182,8 @@ class PacketWorker(QtCore.QThread):
                 # Gold tracking and packet inspection have separate model owners.
                 # Run them on the same timestamped image concurrently, preserving
                 # verification alignment without making gold wait for all three models.
-                seal_bag = self.seal_context.locate(frame)
-                if seal_bag is not None:
-                    packet_result = packet_pool.submit(models.inspect, frame, roi_mask, context_mask=seal_bag.mask)
-                else:
-                    packet_result = packet_pool.submit(models.inspect, frame, roi_mask)
+                # Current packet detection supplies the sealing inspection area.
+                packet_result = packet_pool.submit(models.inspect, frame, roi_mask)
                 detections = self.tracker.process(frame, t, capture=self.capture)
                 pickup = self.tracker.pickup_event(t)
                 # Preserve the original recorder trigger and pre-roll even
@@ -193,16 +200,22 @@ class PacketWorker(QtCore.QThread):
                     recorder.enabled.set()
                 if recorder.error:
                     raise OSError(recorder.error)
+                self.packet_opening.update(frame, bag, t)
                 # Finish inference against the source timestamp, never a reused result.
                 if time.time() - t > 2.5:
+                    self.packet_opening.reset()
                     if self.flow:
                         self.flow.invalidate_packet("Inference exceeded the observation age limit. Pickup and placement results retained; evidence needs review.")
+                    self._log_sealing_diagnostic(frame, t, dict(timestamp=t,
+                        blocker='inference_too_slow', frame_age_seconds=time.time()-t))
                     self.notice.emit("Inference is too slow for reliable transfers at this camera resolution.")
                     self.live_overlay.clear()
                     continue
                 if self.tracker.mode == "LOCKED" and self.flow is None:
                     self.capture = False
                     self.flow = PackingFlow([tr.id for tr in self.tracker.tracks])
+                    if self.handoff:
+                        self.flow.testing_session = self.handoff["testing"]
                     for tr in self.tracker.tracks:
                         j = self.flow.jewels[tr.id]
                         j.last_seen = t
@@ -210,8 +223,10 @@ class PacketWorker(QtCore.QThread):
                         jewel_photo = thumb if thumb is not None and thumb.size else original.crop_box(frame, tr.box, pad=.12)
                         image_save(work / f"J{tr.id}_initial.jpg", jewel_photo)
                     image_save(work / "initial_scene.jpg", frame)
-                    self.notice.emit("Assigned " + ", ".join(f"J{tr.id}" for tr in self.tracker.tracks)
-                                     + ". Preparing SLIC/ResNet identities; keep the jewels visible.")
+                    self.notice.emit(("Continuing with tested " if self.handoff else "Assigned ")
+                                     + ", ".join(f"J{tr.id}" for tr in self.tracker.tracks)
+                                     + (". Existing identities retained; begin packing." if self.handoff else
+                                        ". Preparing SLIC/ResNet identities; keep the jewels visible."))
                 packet_ok, packet_changed = packet_region.update(bag.mask if bag is not None else None, t, clear)
                 if packet_changed and self.flow:
                     self.flow.pause_packet()
@@ -222,10 +237,23 @@ class PacketWorker(QtCore.QThread):
                                      hands_clear=clear, strip=strip,
                                      identities_ready=self.tracker.id_model.ready, pickup=pickup,
                                      packet_stationary=packet_region.stationary,
-                                     packet_context_ok=bag is not None or seal_bag is not None,
-                                     strip_view_ok=bag is not None or self.seal_context.strip_view_ok)
-                    if self.flow.strip_removal_requested and not self.seal_context.ready:
-                        self.seal_context.arm(frame, bag, strip_mask)
+                                     packet_context_ok=bag is not None,
+                                     strip_view_ok=bag is not None)
+                    diagnostic = dict(self.flow.sealing_diagnostic)
+                    if diagnostic:
+                        details = getattr(models, 'last_diagnostic', {})
+                        if isinstance(details, dict):
+                            diagnostic['model'] = details
+                        diagnostic['reference_required'] = False
+                        diagnostic['sealing_check'] = 'current_packet_and_strip_absence'
+                        self._log_sealing_diagnostic(frame, t, diagnostic)
+                    self.packet_opening.record(self.flow, t)
+                    if self.flow.strip_removal_requested:
+                        recorder.enabled.set()
+                        if self.ocr is None:
+                            self.ocr = PacketOCR(ROOT)
+                            self.ocr.prepare()
+                        self.sealing_start = self.flow.sealing_started_at
                     for jid, j in self.flow.jewels.items():
                         if j.started == t:
                             image_save(work / f"J{jid}_pickup.jpg", self._draw(frame, bag, strip_mask, hand_mask))
@@ -235,12 +263,12 @@ class PacketWorker(QtCore.QThread):
                             elif j.status == AT_PACKET:
                                 image_save(work / f"J{jid}_entry.jpg", self._draw(frame, bag, strip_mask, hand_mask))
                             elif j.status == INSIDE:
+                                self.packet_opening.save_placement_frame(frame, j, t, work)
                                 image_save(work / f"J{jid}_entry.jpg", self._draw(frame, bag, strip_mask, hand_mask))
                                 image_save(work / f"J{jid}_after.jpg", self._draw(frame, bag, strip_mask, hand_mask))
                     if self.flow.all_packed:
                         self.first_all_packed = self.first_all_packed or t
-                        self.sealing_start = self.sealing_start or t
-                    if self.tracker.identity_error:
+                    if self.tracker.identity_error and not self.flow.strip_removal_requested:
                         self.flow.message = self.tracker.identity_error
                     elif self.tracker.id_model.ready and not self.identities_announced:
                         self.identities_announced = True
@@ -251,8 +279,8 @@ class PacketWorker(QtCore.QThread):
                             if jewel.clip_ended is None:
                                 jewel.clip_ended = t
                         self.flow.packet_number.update(status="pending")
-                        self.flow.message = "Packet sealed. Rotate the packet to show its number for OCR."
-                        self.last_status = "Packet sealed; packet-number capture pending."
+                        self.flow.message = "Packet sealed. Rotate the packet to show its number for OCR."+self.flow.placement_warning
+                        self.last_status = "Packet sealed; packet-number capture pending."+self.flow.placement_warning
                         self.gold_overlay.clear()
                         self.live_overlay.clear()
                     # Refresh labels after this frame's pickup/inside decision,
@@ -264,12 +292,15 @@ class PacketWorker(QtCore.QThread):
                 state = dict(
                     phase=self.flow.message if self.flow else f"Auto assigning jewels: {self.tracker.arm_count} detected ({self.tracker.stable:.0%}). Keep all jewels separated in the ROI.",
                     packet=packet_ok, packet_source=self.packet_motion.source, strip=strip, clear=clear,
-                    packet_stationary=packet_region.stationary, packet_hand_scope=bag is not None or seal_bag is not None, closure=self.flow.closure_status if self.flow else "pending_strip_removal",
-                    closure_message="Sealing is inferred after verified strip removal; adhesive closure is not directly measured.", strip_enabled=bool(self.flow and self.flow.all_packed),
+                    packet_opening=dict(self.packet_opening.current),
+                    sealing_diagnostic=dict(self.flow.sealing_diagnostic) if self.flow else {},
+                    packet_stationary=packet_region.stationary, packet_hand_scope=bag is not None, closure=self.flow.closure_status if self.flow else "pending_strip_removal",
+                    closure_message="Sealing is inferred after verified strip removal; adhesive closure is not directly measured.", strip_enabled=bool(self.flow),
                     strip_removed=bool(self.flow and self.flow.strip_removed),
                     strip_armed=bool(self.flow and self.flow.strip_removal_requested),
-                    seal_context=seal_bag is not None,
+                    seal_context=False,
                     identities=self.tracker.id_model.ready,
+                    ocr_preparation=self.ocr.preparation_status if self.ocr is not None else 'not_started',
                     jewels=[dict(id=tr.id, thumb=getattr(tr, "thumb", None),
                                  status=self.flow.jewels[tr.id].status, note=self.flow.jewels[tr.id].note)
                             for tr in self.tracker.tracks] if self.flow else [],
@@ -303,6 +334,9 @@ class PacketWorker(QtCore.QThread):
                     self.failed.emit(error)
                 if self.flow:
                     try:
+                        if self.handoff and self.handoff.get('testing_ready') is not None:
+                            self.notice.emit("Packing saved; waiting for background jewel results before exporting the combined report…")
+                            self.handoff['testing_ready'].wait()
                         self.notice.emit("Exporting and checking PDF/video evidence…")
                         if self.last_frame is not None:
                             image_save(work / "final.jpg", self.last_frame)
@@ -316,22 +350,49 @@ class PacketWorker(QtCore.QThread):
                     import shutil
                     shutil.rmtree(self.directory)
 
+    def _log_sealing_diagnostic(self, frame, t, diagnostic):
+        if not diagnostic or self.directory is None:
+            return
+        record = dict(diagnostic)
+        record['logged_at'] = time.time()
+        record['source_timestamp'] = t
+        record['phase'] = 'strip_removal' if self.flow and self.flow.strip_removal_requested else 'packing'
+        blocker = record['blocker']
+        if self.flow is not None and blocker in {'inference_too_slow', 'camera_stream_interrupted', 'stale_camera_frame'}:
+            self.flow._reset_strip_progress()
+            record.update(absent_hits=0, clear_seconds=0., required_hits=5, required_clear_seconds=1.)
+            self.flow.sealing_diagnostic = dict(record)
+            counts = self.flow.sealing_blocker_counts
+            counts[blocker] = counts.get(blocker, 0)+1
+        saved = getattr(self, '_diagnostic_images', set())
+        if frame is not None and blocker not in saved:
+            folder = self.directory / 'sealing_debug'
+            folder.mkdir(exist_ok=True)
+            name = 'sealing_debug/'+blocker+'.jpg'
+            image_save(self.directory / name, frame)
+            record['scene'] = name
+            saved.add(blocker)
+            self._diagnostic_images = saved
+        with (self.directory / 'sealing_diagnostics.jsonl').open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(record)+'\n')
+
     def _read_packet_number(self, frame, t, work):
         if self.ocr is None:
             self.ocr = PacketOCR(ROOT)
         result, accepted = self.ocr.update(frame, self.roi_points, t)
         self.flow.packet_number = dict(result)
-        self.flow.message = result['message']
+        self.flow.message = result['message']+self.flow.placement_warning
         self.last_status = ("Packet sealed; packet number confirmed." if result['status'] == 'confirmed'
-                            else "Packet sealed; packet-number capture incomplete.")
+                            else "Packet sealed; packet-number capture incomplete.")+self.flow.placement_warning
         if accepted is not None:
             image_save(work / "packet_number_crop.jpg", accepted['crop'])
             image_save(work / "packet_number_scene.jpg", accepted['scene'])
             self.flow.packet_number.update(crop="packet_number_crop.jpg", scene="packet_number_scene.jpg")
             self.running = False
-        self.notice.emit(result['message'])
+        self.notice.emit(self.flow.message)
         if self.sealed_state:
-            state = dict(self.sealed_state, phase=result['message'])
+            state = dict(self.sealed_state, phase=self.flow.message,
+                         ocr_preparation=self.ocr.preparation_status)
             self.state.emit(state)
 
     def _publish_gold(self, frame, t):
@@ -353,6 +414,8 @@ class PacketWorker(QtCore.QThread):
                 cv2.drawContours(image, contours, -1, color, 2)
             if key == "bag" and motion:
                 cv2.putText(image, 'Packet ROI - '+self.packet_motion.source, (12, 52), cv2.FONT_HERSHEY_SIMPLEX, .65, color, 2)
+            if key == 'bag' and not motion:
+                self.packet_opening.draw(image)
             self.live_overlay.publish(image, t, key=key, hold_empty=True)
 
     def _transfer_observations(self, frame, t, bag, hand_mask, pickup):
@@ -423,7 +486,7 @@ class PacketWorker(QtCore.QThread):
             jewel = self.flow.jewels[jid]
             if jewel.started is not None or (new_pickup and jid == pickup.jewel_id):
                 existing = observations.get(jid)
-                if existing is None or not (existing.near_packet or existing.packet_overlap >= .1):
+                if existing is None or not existing.transfer_verified:
                     observations[jid] = result
         return observations
 
@@ -475,14 +538,18 @@ class PacketWorker(QtCore.QThread):
                       {jid: j.status for jid, j in self.flow.jewels.items()} if self.flow else None)
         cv2.putText(out, datetime.fromtimestamp(self.last_t or time.time(), TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST"),
                     (12, out.shape[0] - 16), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 2)
+        self.packet_opening.draw(out)
         return out
 
 
 class MainWindow(QtWidgets.QWidget):
-    def __init__(self, *, auto_connect=False):
+    session_exported = QtCore.pyqtSignal(object)
+
+    def __init__(self, *, auto_connect=False, handoff=None):
         super().__init__()
         self.setWindowTitle("Packet Sealing — Jewel Guard")
         self.worker = None
+        self.handoff = handoff
         self.restart_pending = False
         self.regions_locked = False
         self.roi = []
@@ -530,7 +597,7 @@ class MainWindow(QtWidgets.QWidget):
         self.phase.setStyleSheet("font-weight:bold;font-size:16px;color:#075985;padding:8px")
         self.checks = QtWidgets.QLabel("Gold: INT8 | SLIC identities | Jewel Tracker ROI loaded" if self.roi else "Gold: INT8 | SLIC identities | Draw bench ROI")
         self.checks.setWordWrap(True)
-        self.instruction = QtWidgets.QLabel("Pickup fixes the jewel ID and starts recording. Hand OR moving gold from the current pickup reaching the packet confirms transfer. No identity check inside, disappearance or clear-hands wait. Packet movement and brief detection gaps retain progress. The next pickup switches recording without failing the previous transfer. After all placements: put the packet on the test bed with its strip visible. Once verified, remove the strip. The strip area must be visible; the whole bag is not required. Confirmed strip removal completes sealing and stays retained. Then rotate the packet to show its number inside the bench ROI. Three matching OCR reads complete the session and save the PDF/videos.")
+        self.instruction = QtWidgets.QLabel("Pickup fixes the jewel ID and starts recording. Hand contact with the packet records an interaction only. Inferred transfer requires a continuous pickup-hand approach from outside across the packet boundary in two observations, or pickup-owned moving gold arriving from outside. The physical opening and hidden contents are not verified. Packet movement and brief detection gaps retain progress. The next pickup switches recording without failing the previous transfer. After all placements: put the packet on the test bed with its strip visible. Once verified, remove the strip. Keep the packet detected and hands clear while strip absence is checked. Confirmed strip removal completes sealing and stays retained. Then rotate the packet to show its number inside the bench ROI. Three matching OCR reads complete the session and save the PDF/videos.")
         self.instruction.setWordWrap(True)
         self.notice = QtWidgets.QLabel("")
         self.notice.setWordWrap(True)
@@ -616,7 +683,8 @@ class MainWindow(QtWidgets.QWidget):
         self.preview_timestamp = None
         self.regions_locked = False
         previous = self.worker
-        self.worker = PacketWorker(source, self.roi, self)
+        self.worker = (PacketWorker(source, self.roi, self, handoff=self.handoff) if self.handoff else
+                       PacketWorker(source, self.roi, self))
         if previous is not None and hasattr(previous, "deleteLater"):
             previous.deleteLater()
         self.worker.state.connect(self.show_state)
@@ -632,6 +700,11 @@ class MainWindow(QtWidgets.QWidget):
         self.shared_roi_button.setEnabled(True)
         self.table.setRowCount(0)
         self.notice.clear()
+        if self.handoff:
+            self.source.setEchoMode(QtWidgets.QLineEdit.Password)
+            for control in (self.reset_button, self.roi_button, self.shared_roi_button):
+                control.setEnabled(False)
+            self.phase.setText("Continue packing the tested jewels using their existing IDs.")
 
     def reset_process(self):
         if self.restart_pending:
@@ -724,34 +797,62 @@ class MainWindow(QtWidgets.QWidget):
     def show_state(self, state):
         self.phase.setText(state["phase"])
         strip = ("removed (retained)" if state.get("strip_removed") else
-                 state["strip"] if state["strip_enabled"] else "waiting for jewel transfers")
+                 state["strip"] if state["strip_enabled"] else "waiting for assignment")
         stationary = "test-bed baseline retained" if state.get("strip_armed") and not state["packet_stationary"] else str(state["packet_stationary"])
         hand_status = ('clear' if state['clear'] else 'present') if state.get('packet_hand_scope', True) else 'unverified'
         self.checks.setText(f"Gold: INT8 | Packet: {'verified' if state['packet'] else 'motion tracking' if state.get('packet_source') == 'motion' else 'saved body context' if state.get('seal_context') else 'visibility pending'} | Strip: {strip} | Packet hands: {hand_status} | Stationary: {stationary} | Sealing: {'sealed (inferred)' if state['closure'] == 'inferred_from_strip_removal' else 'waiting for strip removal'} | SLIC IDs: {'ready' if state['identities'] else 'preparing'}")
         self.checks.setToolTip(state["closure_message"])
-        self.roi_button.setEnabled(state["can_draw"])
-        self.shared_roi_button.setEnabled(state["can_draw"])
+        diagnostic = state.get('sealing_diagnostic', {})
+        if diagnostic:
+            self.checks.setText(self.checks.text()+f" | Removal: {diagnostic.get('absent_hits', 0)}/5, {diagnostic.get('clear_seconds', 0):.1f}/1.0 s | {diagnostic.get('blocker', '')}")
+        opening=state.get('packet_opening',{})
+        label=opening.get('label')
+        description=(f"{label} {opening.get('probability',0):.0%} ({'consistent' if opening.get('consistent') else 'unconfirmed'})"
+                     if label else opening.get('status','unavailable'))
+        self.checks.setText(self.checks.text()+' | Packet view: '+description+
+                            ' | OCR: '+state.get('ocr_preparation', 'not_started'))
+        self.roi_button.setEnabled(state["can_draw"] and not self.handoff)
+        self.shared_roi_button.setEnabled(state["can_draw"] and not self.handoff)
         self.regions_locked = not state["can_draw"]
         if self.regions_locked:
             self.drawing, self.draft = None, []
         self.output_directory = Path(state["directory"])
         selected = self.table.currentRow()
-        self.table.setRowCount(len(state["jewels"]))
+        if self.table.rowCount() != len(state["jewels"]):
+            self.table.setRowCount(len(state["jewels"]))
         for row, item in enumerate(state["jewels"]):
-            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(f"J{item['id']}"))
-            label = QtWidgets.QLabel()
-            if item["thumb"] is not None:
-                label.setPixmap(QtGui.QPixmap.fromImage(original.to_qimage(item["thumb"])).scaled(90, 65, QtCore.Qt.KeepAspectRatio))
-            self.table.setCellWidget(row, 1, label)
+            cell = self.table.item(row, 0)
+            if cell is None:
+                cell = QtWidgets.QTableWidgetItem()
+                self.table.setItem(row, 0, cell)
+            value = f"J{item['id']}"
+            if cell.text() != value:
+                cell.setText(value)
+            label = self.table.cellWidget(row, 1)
+            if label is None:
+                label = QtWidgets.QLabel()
+                label._packet_thumb = None
+                self.table.setCellWidget(row, 1, label)
+            if label._packet_thumb is not item["thumb"]:
+                if item["thumb"] is not None:
+                    label.setPixmap(QtGui.QPixmap.fromImage(original.to_qimage(item["thumb"])).scaled(90, 65, QtCore.Qt.KeepAspectRatio))
+                else:
+                    label.clear()
+                label._packet_thumb = item["thumb"]
             for column, key in ((2, "status"), (3, "note")):
-                cell = QtWidgets.QTableWidgetItem(item[key])
-                if item["status"] == INSIDE:
-                    cell.setBackground(QtGui.QColor("#dcfce7"))
-                elif item["status"] == "Uncertain":
-                    cell.setBackground(QtGui.QColor("#ffedd5"))
-                self.table.setItem(row, column, cell)
-            self.table.setRowHeight(row, 85)
-        if 0 <= selected < self.table.rowCount():
+                cell = self.table.item(row, column)
+                if cell is None:
+                    cell = QtWidgets.QTableWidgetItem()
+                    self.table.setItem(row, column, cell)
+                if cell.text() != item[key]:
+                    cell.setText(item[key])
+                color = ("#dcfce7" if item["status"] == INSIDE else
+                         "#ffedd5" if item["status"] == "Uncertain" else "transparent")
+                if cell.background().color() != QtGui.QColor(color):
+                    cell.setBackground(QtGui.QColor(color))
+            if self.table.rowHeight(row) != 85:
+                self.table.setRowHeight(row, 85)
+        if 0 <= selected < self.table.rowCount() and self.table.currentRow() != selected:
             self.table.selectRow(selected)
 
     def finish_session(self):
@@ -767,10 +868,13 @@ class MainWindow(QtWidgets.QWidget):
         self.phase.setText("Attention required")
 
     def show_export(self, result):
+        self.session_exported.emit(result)
         self.output_directory = Path(result["directory"])
         number = result.get('packet_number', {})
         phase = (f"Sealed — packet number: {number['text']}" if number.get('status') == 'confirmed' else
                  "Sealed — packet number not confirmed") if result['sealed'] else "Session saved — incomplete / review required"
+        if result.get('placement_review_required'):
+            phase += ' — jewel placements require review'
         self.phase.setText(phase)
         size = "All evidence groups met the 2 MB target." if result["all_budgets_met"] else "Some evidence exceeds 2 MB; source recording retained."
         self.notice.setText(f"{size}\nSaved to: {self.output_directory}")
@@ -787,14 +891,14 @@ class MainWindow(QtWidgets.QWidget):
                     self.table.setItem(row, column, cell)
 
     def worker_finished(self):
-        self.connect_button.setEnabled(True)
+        self.connect_button.setEnabled(not self.handoff or (self.worker is not None and self.worker.flow is None))
         self.connect_button.setText("New session / Connect")
-        self.source.setEnabled(True)
+        self.source.setEnabled(not self.handoff)
         self.finish_button.setEnabled(False)
         if self.restart_pending:
             QtCore.QTimer.singleShot(0, self._restart_after_save)
             return
-        self.reset_button.setEnabled(True)
+        self.reset_button.setEnabled(not self.handoff)
         if self.worker and self.worker.flow is None:
             self.phase.setText("Session ended. No jewels were captured.")
 

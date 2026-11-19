@@ -25,6 +25,25 @@ class PreviewTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
+    def test_jewel_table_reuses_widgets_and_retains_selection(self):
+        window = MainWindow()
+        self.addCleanup(window.close)
+        item = dict(id=1, thumb=np.zeros((30, 30, 3), np.uint8), status='On bench', note='Waiting')
+        state = dict(phase='Packing', strip='unknown', strip_enabled=True, packet_stationary=False,
+                     clear=True, packet=True, closure='pending', closure_message='Waiting',
+                     identities=True, can_draw=True, directory='/tmp', jewels=[item])
+        window.show_state(state)
+        widget = window.table.cellWidget(0, 1)
+        cells = [window.table.item(0, col) for col in (0, 2, 3)]
+        window.table.selectRow(0)
+        item.update(status=INSIDE, note='Placement inferred')
+        window.show_state(state)
+        self.assertIs(window.table.cellWidget(0, 1), widget)
+        for cell, column in zip(cells, (0, 2, 3)):
+            self.assertIs(window.table.item(0, column), cell)
+        self.assertEqual(window.table.item(0, 2).text(), INSIDE)
+        self.assertEqual(window.table.currentRow(), 0)
+
     def test_preview_reads_new_camera_frames_without_inference_results(self):
         window = MainWindow()
         window.roi = []
@@ -108,18 +127,28 @@ class PreviewTests(unittest.TestCase):
                 self.assertTrue(config["antiflicker"]["enabled"])
                 self.assertEqual(config["antiflicker"]["shutter_denom"], 50)
 
-    def test_packet_masks_decode_at_bounded_resolution_and_return_full_coordinates(self):
+    def test_packet_inspection_preserves_source_frame_masks_and_coordinates(self):
         models = PacketModels.__new__(PacketModels)
-        def inspect(frame, roi):
-            self.assertEqual(frame.shape[:2], (540, 960))
-            mask = np.full((540, 960), 255, np.uint8)
-            return Detection(mask, (96, 54, 480, 270), .9), "present", True, mask, mask
-        models._inspect_native = inspect
         frame = np.zeros((1440, 2560, 3), np.uint8)
-        bag, _, _, strip, hand = models.inspect(frame, np.full((1440, 2560), 255, np.uint8))
-        self.assertEqual(bag.box, (256, 144, 1280, 720))
-        for mask in (bag.mask, strip, hand):
-            self.assertEqual(mask.shape, (1440, 2560))
+        roi = np.full(frame.shape[:2], 255, np.uint8)
+        context = roi.copy()
+        zone = np.zeros_like(roi)
+        zone[144:170, 256:1280] = 255
+        bag = Detection(roi, (256, 144, 1280, 720), .9)
+        result = (bag, "present", True, zone, roi)
+        for context_mask, inspection_zone in ((None, None), (context, None),
+                                               (None, zone), (context, zone)):
+            with self.subTest(context=context_mask is not None, zone=inspection_zone is not None):
+                models._inspect_native = Mock(return_value=result)
+                actual = models.inspect(frame, roi, context_mask, inspection_zone)
+                args = models._inspect_native.call_args.args
+                self.assertEqual(models._inspect_native.call_count, 1)
+                for passed, source in zip(args, (frame, roi, context_mask, inspection_zone)):
+                    self.assertIs(passed, source)
+                self.assertIs(actual, result)
+                self.assertEqual(actual[0].box, (256, 144, 1280, 720))
+                for mask in (actual[0].mask, actual[3], actual[4]):
+                    self.assertEqual(mask.shape, (1440, 2560))
 
 
 if __name__ == "__main__":

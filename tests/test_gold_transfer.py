@@ -85,7 +85,7 @@ class GoldTransferTests(unittest.TestCase):
         worker._observations = Mock(return_value={})
         worker.transfer.start(2, (500, 200), 100.)
         frame = np.zeros(self.shape, np.uint8)
-        for i, x in enumerate((500, 450, 400, 350, 300, 250, 200)):
+        for i, x in enumerate((500, 450, 400, 350, 300, 250, 200, 180)):
             t = 100.+i*.2
             hand = np.zeros(self.shape[:2], np.uint8)
             cv2.circle(hand, (x, 200), 30, 255, -1)

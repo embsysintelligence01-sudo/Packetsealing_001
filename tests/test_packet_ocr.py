@@ -2,6 +2,7 @@
 from concurrent.futures import Future
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -13,6 +14,49 @@ from standalone.packet_ocr import NumberConsensus, NumberDetector, PacketOCR
 
 
 class OCRTests(unittest.TestCase):
+    def test_preparation_is_background_idempotent_and_cannot_vote(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = PacketOCR(Path(root))
+            entered, release = threading.Event(), threading.Event()
+            def prepare():
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError('Test preparation timed out')
+                return True
+            try:
+                with patch.object(service, '_prepare', side_effect=prepare), patch.object(service, '_read') as read:
+                    service.prepare()
+                    self.assertTrue(entered.wait(1))
+                    future = service.prepare_future
+                    service.prepare()
+                    self.assertIs(service.prepare_future, future)
+                    self.assertEqual(service.preparation_status, 'loading')
+                    state, accepted = service.update(np.zeros((10, 10, 3), np.uint8), [], 100.)
+                    self.assertIsNone(accepted)
+                    self.assertEqual(state['status'], 'pending')
+                    read.assert_not_called()
+                    release.set()
+                    future.result(timeout=1)
+                    self.assertEqual(service.preparation_status, 'ready')
+                    self.assertEqual(service.consensus.hits, 0)
+            finally:
+                release.set()
+                service.close()
+
+    def test_preparation_failure_preserves_finish_save(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = PacketOCR(Path(root))
+            service.prepare_future = Future()
+            service.prepare_future.set_exception(RuntimeError('OCR environment missing'))
+            try:
+                self.assertEqual(service.preparation_status, 'error')
+                state, accepted = service.update(np.zeros((10, 10, 3), np.uint8), [], 100.)
+                self.assertEqual(state['status'], 'error')
+                self.assertIn('Finish / Save', state['message'])
+                self.assertIsNone(accepted)
+            finally:
+                service.close()
+
     def test_three_matching_fresh_confident_reads_required(self):
         c = NumberConsensus()
         self.assertFalse(c.observe('pc123456', .98, 100.))

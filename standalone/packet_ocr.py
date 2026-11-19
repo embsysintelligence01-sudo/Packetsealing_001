@@ -1,4 +1,4 @@
-"""Post-sealing number capture, with Paddle isolated in another interpreter."""
+"""Prepare OCR during sealing; capture the number afterward in an isolated interpreter."""
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -102,11 +102,40 @@ class PacketOCR:
         self.python = Path(os.environ.get("PACKET_OCR_PYTHON", self.root / ".venv-ocr/bin/python"))
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="packet-ocr")
         self.future = self.process = self.detector = None
+        self.prepare_future = None
         self.closed = False
         self.last_submit = -float('inf')
         self.consensus = NumberConsensus()
         self.result = dict(status="pending", text=None, confidence=None, confirmed_at=None,
                            method="pcnumber_obb_paddleocr", message="Rotate the packet to show its number.")
+
+    def prepare(self):
+        """Load OCR during sealing without reading or voting on a number."""
+        if not self.closed and self.prepare_future is None:
+            self.prepare_future = self.pool.submit(self._prepare)
+
+    @property
+    def preparation_status(self):
+        if self.prepare_future is None:
+            return 'not_started'
+        if not self.prepare_future.done():
+            return 'loading'
+        try:
+            return 'ready' if self.prepare_future.result() else 'closed'
+        except Exception:
+            return 'error'
+
+    def _prepare(self):
+        if self.closed:
+            return False
+        if self.detector is None:
+            self.detector = NumberDetector(self.root / 'model onnx/pcnumber.onnx')
+        response = self._request(dict(prepare=True))
+        if self.closed:
+            return False
+        if response is None or not response.get('ready'):
+            raise RuntimeError('OCR preparation did not acknowledge readiness.')
+        return True
 
     def _read(self, frame, roi, t):
         if self.detector is None:
@@ -114,6 +143,13 @@ class PacketOCR:
         crop, polygon = self.detector.crop(frame, roi)
         if crop is None:
             return dict(text="", confidence=0., t=t, crop=None, polygon=None)
+        ok, encoded = cv2.imencode('.png', crop)
+        if not ok:
+            raise RuntimeError("Unable to encode packet number crop")
+        response = self._request(dict(image=base64.b64encode(encoded).decode('ascii')))
+        return dict(**response, t=t, crop=crop, polygon=polygon, scene=frame) if response is not None else None
+
+    def _request(self, payload):
         if not self.python.is_file():
             raise RuntimeError("OCR environment missing. Run setup_packet_ocr.sh.")
         if self.closed:
@@ -126,10 +162,7 @@ class PacketOCR:
         if self.closed:
             self.process.terminate()
             return None
-        ok, encoded = cv2.imencode('.png', crop)
-        if not ok:
-            raise RuntimeError("Unable to encode packet number crop")
-        request = json.dumps(dict(image=base64.b64encode(encoded).decode('ascii')))
+        request = json.dumps(payload)
         self.process.stdin.write(request+'\n')
         self.process.stdin.flush()
         # First request can download/load OCR weights; bounded and interruptible.
@@ -149,11 +182,20 @@ class PacketOCR:
                 response = json.loads(line[len('PACKET_OCR:'):])
                 if response.get('error'):
                     raise RuntimeError(response['error'])
-                return dict(**response, t=t, crop=crop, polygon=polygon, scene=frame)
+                return response
         return None
 
     def update(self, frame, roi, t):
         accepted = None
+        if self.prepare_future is not None:
+            if not self.prepare_future.done():
+                self.result['message'] = 'Packet sealed; OCR is loading in the background. Show its number clearly.'
+                return self.result, None
+            try:
+                self.prepare_future.result()
+            except Exception as exc:
+                self.result.update(status='error', message=f'Packet sealed; OCR unavailable: {exc}. Finish / Save retains the session.')
+                return self.result, None
         if self.future is not None and self.future.done():
             try:
                 read = self.future.result()

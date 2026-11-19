@@ -117,7 +117,10 @@ class GoldTransfer:
         moved = np.linalg.norm(point-self.anchor) >= max(12., diagonal*.012)
         if inside and moved and self.hits >= 2 and self.outside_seen:
             self.last_interaction = Observation(tuple(point), packet_overlap=max(overlap, .1), near_packet=True,
-                                                identity_ok=False, method='pickup_owned_gold_packet_interaction')
+                                                identity_ok=False, method='pickup_owned_gold_packet_interaction',
+                                                transfer_verified=True,
+                                                evidence=dict(kind='pickup_owned_gold_outside_to_packet', opening_verified=False,
+                                                              observations=self.hits, confirmed_at=t))
             self.last_interaction_t = t
             return self.last_interaction
         return None

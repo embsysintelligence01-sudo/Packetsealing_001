@@ -170,6 +170,7 @@ def compact_clip(exe, source, target, offset, duration, budget):
 def export_session(directory, work, recorder, flow, finish_t, status, exe, sealing_start=None):
     """One shared report, individual jewel clips, and the packet sealing clip."""
     from .report import write_session_report
+    sealing_start = flow.sealing_started_at if flow.sealing_started_at is not None else sealing_start
     summary = directory / "report.pdf"
     result = dict(status=status, sealed=flow.sealed, size_target_bytes=BUDGET,
                   size_scope="Each jewel clip: 2 MB; shared report plus sealing clip: 2 MB",
@@ -180,7 +181,12 @@ def export_session(directory, work, recorder, flow, finish_t, status, exe, seali
                   packet_stationary=flow.packet_stationary, initial_strip_verified=flow.strip_seen,
                   bed_verified_at=flow.bed_verified_at, strip_removed=flow.strip_removed,
                   strip_removed_at=flow.strip_removed_at)
+    result['sealing_diagnostics'] = dict(last=dict(flow.sealing_diagnostic), blocker_counts=dict(flow.sealing_blocker_counts),
+        observations='sealing_diagnostics.jsonl' if (directory/'sealing_diagnostics.jsonl').is_file() else None,
+        images='sealing_debug' if (directory/'sealing_debug').is_dir() else None)
+    result['testing_session'] = getattr(flow, 'testing_session', None)
     result['packet_number'] = dict(flow.packet_number)
+    result['packet_opening_model'] = dict(flow.packet_opening_model)
     result.update(sealing_started_at=sealing_start,
                   sealing_ended_at=flow.strip_removed_at if flow.strip_removed else None)
     if (work / 'sealed.jpg').is_file():
@@ -191,6 +197,7 @@ def export_session(directory, work, recorder, flow, finish_t, status, exe, seali
         if name and (work / name).is_file():
             shutil.copy2(work / name, directory / name)
     review_reasons = [recorder.error] if recorder.error else []
+    placement_review = []
     keep_raw = bool(recorder.error)
     for jid, j in flow.jewels.items():
         starts = [v for v in [j.started, *(a.get("start") for a in j.attempts)] if v is not None]
@@ -206,10 +213,26 @@ def export_session(directory, work, recorder, flow, finish_t, status, exe, seali
             issues.append("Recording gap overlaps transfer; review required.")
         review_reasons.extend(issues)
         keep_raw |= bool(issues)
+        if j.status != INSIDE:
+            issue = (f'J{jid}: no pickup was recorded; placement unconfirmed.' if j.started is None else
+                     f'J{jid}: pickup recorded but placement unconfirmed.')
+            placement_review.append(issue)
+            issues.append(issue)
+            keep_raw = True
         record = dict(id=jid, status=j.status, note=j.note, start=j.started, entry=j.entry,
+                      interaction_at=j.interaction_at,
                       end=j.ended, clip_end=j.clip_ended, attempts=j.attempts, pdf=summary.name,
                       placement_method=j.placement_method, evidence_status="review_required" if issues else "recorded",
+                      placement_evidence=dict(j.placement_evidence),
                       evidence_issues=issues)
+        record.update(packet_opening_observations=list(j.packet_opening_observations),
+                      packet_opening_at_placement=j.packet_opening_at_placement)
+        placement=j.packet_opening_at_placement or {}
+        for source_key,result_key in (('frame','placement_frame'),('packet_crop','placement_packet_crop')):
+            name=placement.get(source_key)
+            if name and (work/name).is_file():
+                shutil.copy2(work/name,directory/name)
+                record[result_key]=name
         if start is not None and recorder.start is not None and recorder.end is not None:
             lo, hi = max(start, recorder.start), min(end, recorder.end)
             if hi > lo:
@@ -220,15 +243,24 @@ def export_session(directory, work, recorder, flow, finish_t, status, exe, seali
                 result["exports"].append(record)
                 keep_raw |= not record["budget_met"]
         result["jewels"].append(record)
-    if not flow.all_packed or review_reasons or flow.sealing_method != "strip_removal_inferred" or not flow.strip_removed or not flow.strip_removal_requested:
+    if review_reasons or flow.sealing_method != "strip_removal_inferred" or not flow.strip_removed or not flow.strip_removal_requested:
         flow.sealed = False
-    result.update(sealed=flow.sealed, evidence_review=review_reasons)
+    result.update(sealed=flow.sealed, evidence_review=review_reasons+placement_review,
+                  placement_review_required=bool(placement_review),
+                  unconfirmed_placements=flow.unconfirmed_placements,
+                  all_placements_inferred=flow.all_packed)
     lo = hi = None
     if recorder.start is not None and recorder.end is not None:
         lo = max(recorder.start, sealing_start - 2) if sealing_start is not None else recorder.start
         hi = min(finish_t, recorder.end)
         if hi > lo:
             result["sealing_video"] = "packet_sealing.avi"
+    testing = result.get('testing_session')
+    if testing:
+        source = Path(testing['directory']) / 'report.pdf'
+        if source.is_file():
+            shutil.copy2(source, directory / 'jewel_testing_report.pdf')
+            testing['report'] = 'jewel_testing_report.pdf'
     # Render before sizing the sealing clip; all jewel sections are in this PDF.
     write_session_report(summary, directory, work, flow, result, finish_t, clock_text)
     report_export = dict(pdf=summary.name, combined_bytes=summary.stat().st_size,

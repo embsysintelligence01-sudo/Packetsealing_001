@@ -1,0 +1,4 @@
+-r requirements.txt
+onnxruntime>=1.17,<2
+torch>=2.2,<3
+ultralytics>=8.4,<9

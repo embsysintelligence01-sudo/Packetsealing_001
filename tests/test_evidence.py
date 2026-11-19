@@ -56,7 +56,10 @@ class EvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             work, recorder, flow = self.fixture(root)
+            flow.packet_opening_model={'status':'ready','validation':{'accuracy':.6962}}
+            flow.jewels[1].packet_opening_observations=[dict(label='OPEN_SIDE',first_seen=101.,last_seen=102.,samples=4,probability=.9)]
             result = export_session(root, work, recorder, flow, 102.9, "Synthetic test", exe, 102.4)
+            self.assertEqual(result['jewels'][0]['packet_opening_observations'][0]['label'],'OPEN_SIDE')
             self.assertTrue(result["sealed"])
             self.assertEqual(result["sealing_method"], "strip_removal_inferred")
             self.assertEqual(result["closure"]["status"], "inferred_from_strip_removal")
@@ -64,6 +67,9 @@ class EvidenceTests(unittest.TestCase):
                 report_text = subprocess.check_output(['pdftotext', str(root / 'report.pdf'), '-'], text=True)
                 self.assertIn('SEALED (INFERRED)', report_text)
                 self.assertIn('Sealing is inferred from verified strip removal', ' '.join(report_text.split()))
+                self.assertIn('viewed from the side with an apparent opening', ' '.join(report_text.split()))
+                self.assertIn('inferred placed inside from transfer evidence', ' '.join(report_text.split()))
+                self.assertIn('69.6%',report_text)
             self.assertTrue(result["all_budgets_met"])
             self.assertEqual(len(result["exports"]), 2)
             self.assertTrue(all(r["combined_bytes"] <= 2_000_000 for r in result["exports"]))
@@ -92,6 +98,28 @@ class EvidenceTests(unittest.TestCase):
             if shutil.which('pdftotext'):
                 text = subprocess.check_output(['pdftotext', str(root / 'report.pdf'), '-'], text=True)
                 self.assertIn('Packet number: PC123456', text)
+
+    def test_single_placement_frame_classification_is_in_pdf_and_survives_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            work,recorder,flow=self.fixture(root)
+            flow.jewels[1].packet_opening_at_placement=dict(
+                timestamp=102.4,status='classified',label='OPEN_CAMERA',probability=.919,
+                consistent=False,basis='single_placement_frame',frame='J1_placement.jpg',
+                packet_crop='J1_placement_packet.jpg')
+            for name in ('J1_placement.jpg','J1_placement_packet.jpg'):
+                image_save(work/name,np.full((100,150,3),180,np.uint8))
+            result=export_session(root,work,recorder,flow,102.9,'Placement-frame check',ffmpeg_path())
+            self.assertFalse(work.exists())
+            self.assertTrue((root/result['jewels'][0]['placement_frame']).is_file())
+            self.assertTrue((root/result['jewels'][0]['placement_packet_crop']).is_file())
+            if shutil.which('pdftotext'):
+                text=subprocess.check_output(['pdftotext',str(root/'report.pdf'),'-'],text=True)
+                text=' '.join(text.split())
+                self.assertIn('91.9%',text)
+                self.assertIn('camera-facing packet opening',text)
+                self.assertIn('temporal consistency not established',text)
+                self.assertIn('Placement-frame timestamp:',text)
 
     def test_early_finish_keeps_sealing_but_does_not_confirm_candidate_number(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -132,7 +160,34 @@ class EvidenceTests(unittest.TestCase):
                 self.assertIn(f'J{jid} | Packing evidence', pages[index])
                 for label in ('01 / Pickup', '02 / Packet interaction', '03 / Placement result retained'):
                     self.assertIn(label, pages[index])
-            self.assertFalse(result['sealed'])
+            self.assertTrue(result['sealed'])
+            self.assertTrue(result['placement_review_required'])
+            self.assertEqual(result['unconfirmed_placements'],[2])
+            self.assertIn('PLACEMENT REVIEW:',text)
+
+    def test_taken_unconfirmed_jewel_does_not_revoke_verified_strip_sealing(self):
+        from standalone.flow import PICKED
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            work,recorder,flow=self.fixture(root)
+            jewel=flow.jewels[1]
+            jewel.status=PICKED
+            jewel.entry=jewel.ended=None
+            flow.sealing_started_at=100.8
+            result=export_session(root,work,recorder,flow,102.9,'Strip removed; placement unconfirmed.',ffmpeg_path(),102.4)
+            self.assertTrue(result['sealed'])
+            self.assertEqual(result['sealing_started_at'],100.8)
+            self.assertTrue(result['placement_review_required'])
+            self.assertEqual(result['unconfirmed_placements'],[1])
+            self.assertEqual(result['jewels'][0]['status'],PICKED)
+            self.assertIsNone(result['jewels'][0]['end'])
+            self.assertEqual(result['jewels'][0]['evidence_status'],'review_required')
+            self.assertTrue(work.exists())
+            if shutil.which('pdftotext'):
+                text=subprocess.check_output(['pdftotext',str(root/'report.pdf'),'-'],text=True)
+                self.assertIn('SEALED (INFERRED)',text)
+                self.assertIn('Placement not confirmed;',text)
+                self.assertIn('JEWEL PLACEMENTS UNCONFIRMED: J1',text)
 
     def test_previous_jewel_clip_ends_at_next_pickup_timestamp(self):
         with tempfile.TemporaryDirectory() as tmp:

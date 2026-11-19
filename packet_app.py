@@ -7,14 +7,18 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 TRACKER = Path(os.environ.get("JEWEL_TRACKER_DIR", ROOT.parent / "jewel_tracker/jewel_tracker"))
-if not (TRACKER / "jewel_tracker_5.py").is_file():
-    raise SystemExit("Set JEWEL_TRACKER_DIR to the directory containing jewel_tracker_5.py.")
 sys.path.insert(0, str(TRACKER))
 os.environ.setdefault("YOLO_AUTOINSTALL", "False")
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
 
 def main():
+    # The mouth experiment runs without importing the jewel tracker or its models.
+    if "--mouth-lab" in sys.argv[1:]:
+        from packet_mouth_lab.app import main as mouth_main
+        return mouth_main([arg for arg in sys.argv[1:] if arg != "--mouth-lab"])
+    if not (TRACKER / "jewel_tracker_5.py").is_file():
+        raise SystemExit("Set JEWEL_TRACKER_DIR to the directory containing jewel_tracker_5.py.")
     parser = argparse.ArgumentParser(description="Standalone SLIC jewel-to-packet sealing application")
     parser.add_argument("--check-models", action="store_true", help="Load all required models and run a CPU smoke check without a camera")
     parser.add_argument("--smoke-ui", action="store_true", help="Construct the UI and exit without opening a camera")

@@ -81,7 +81,7 @@ class PacketMotionTests(unittest.TestCase):
         class Follower:
             owner = 1
             def observe(self, *args):
-                return Observation((100, 100), near_packet=True, identity_ok=False) if self.owner == 1 else None
+                return Observation((100, 100), near_packet=True, identity_ok=False, transfer_verified=True) if self.owner == 1 else None
             def start(self, owner, *args):
                 self.owner = owner
         worker.transfer = Follower()

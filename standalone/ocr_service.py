@@ -24,6 +24,11 @@ def main():
                                        use_doc_orientation_classify=False, use_doc_unwarping=False,
                                        use_textline_orientation=True, enable_mkldnn=False)
                 request = json.loads(line)
+                if request.get('prepare'):
+                    # Readiness never supplies text or contributes consensus votes.
+                    response = dict(ready=True)
+                    print('PACKET_OCR:'+json.dumps(response), file=sys.__stdout__, flush=True)
+                    continue
                 image = cv2.imdecode(np.frombuffer(base64.b64decode(request['image']), np.uint8), cv2.IMREAD_COLOR)
                 if image is None:
                     raise ValueError("Invalid crop image")

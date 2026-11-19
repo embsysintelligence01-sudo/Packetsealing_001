@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 outputs/
 packet_ui_settings.json
+packet_mouth_lab/dataset/
+packet_mouth_lab/evidence/
+packet_mouth_lab/models/
 .venv-ocr/
 
 # AI models
@@ -104,3 +107,6 @@ outputs/
 build/
 dist/
 *.log
+
+# Local marker-only camera ROI
+aruco_roi.json

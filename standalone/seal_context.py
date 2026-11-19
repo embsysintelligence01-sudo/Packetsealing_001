@@ -11,6 +11,7 @@ class SealContext:
         self.size = None
         self.current = None
         self.strip_view_ok = False
+        self.inspection_zone = None
 
     @property
     def ready(self):
@@ -36,6 +37,7 @@ class SealContext:
 
     def locate(self, frame):
         self.current, self.strip_view_ok = None, False
+        self.inspection_zone = None
         if not self.ready:
             return None
         gray = cv2.cvtColor(cv2.resize(frame, self.size), cv2.COLOR_BGR2GRAY)
@@ -62,6 +64,7 @@ class SealContext:
         if np.count_nonzero(mask) < 100:
             return None
         h, w = frame.shape[:2]
+        self.inspection_zone = cv2.resize(zone, (w, h), interpolation=cv2.INTER_NEAREST)
         full = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         x, y, bw, bh = cv2.boundingRect(full)
         self.current = Detection(full, (x, y, x+bw, y+bh), 0.)
